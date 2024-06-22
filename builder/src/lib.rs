@@ -22,6 +22,7 @@ pub fn derive(input: TokenStream) -> TokenStream {
     let builder_struct = builder.struct_def();
     let default_instance = builder.default_instance();
     let setters = builder.setter_methods();
+    let build = builder.build_method();
 
     quote! {
         #builder_struct
@@ -29,6 +30,7 @@ pub fn derive(input: TokenStream) -> TokenStream {
         #[automatically_derived]
         impl #builder_name {
             #(#setters)*
+            #build
         }
 
         #[automatically_derived]
@@ -43,11 +45,13 @@ pub fn derive(input: TokenStream) -> TokenStream {
 
 struct Builder {
     name: Ident,
+    input_name: Ident,
     fields: Punctuated<Field, Comma>,
 }
 
 impl Builder {
     fn try_new(input: &DeriveInput) -> Result<Self, Error> {
+        let input_name = input.ident.clone();
         let name = Ident::new(&format!("{}Builder", input.ident), input.ident.span());
 
         let Data::Struct(ds) = &input.data else {
@@ -71,7 +75,11 @@ impl Builder {
             field.attrs.clear();
         }
 
-        Ok(Self { name, fields })
+        Ok(Self {
+            name,
+            input_name,
+            fields,
+        })
     }
 
     fn struct_def(&self) -> TokenStream2 {
@@ -79,7 +87,7 @@ impl Builder {
         let optionalised_fields = self.fields.iter().map(|field| {
             let mut field = field.clone();
             let curr_ty = field.ty;
-            field.ty = parse_quote! { Option<#curr_ty> };
+            field.ty = parse_quote! { ::std::option::Option<#curr_ty> };
             field
         });
 
@@ -96,7 +104,7 @@ impl Builder {
 
         quote! {
             #builder_name {
-                #(#field_names: None),*
+                #(#field_names: ::std::option::Option::None),*
             }
         }
     }
@@ -109,11 +117,33 @@ impl Builder {
                 let field_type = &field.ty;
                 quote! {
                     fn #name(&mut self, #name: #field_type) -> &mut Self {
-                        self.#name = Some(#name);
+                        self.#name = ::std::option::Option::Some(#name);
                         self
                     }
                 }
             })
             .collect()
+    }
+
+    fn build_method(&self) -> TokenStream2 {
+        let name = &self.input_name;
+        let extract_values = self.fields.iter().map(|field| {
+            let field_name = &field.ident;
+            quote! {
+                let #field_name = self.#field_name.ok_or("#field_name")?;
+            }
+        });
+
+        let field_names = self.fields.iter().map(|field| &field.ident);
+
+        quote! {
+            fn build(self) -> ::std::result::Result<#name, ::std::boxed::Box<dyn ::std::error::Error>> {
+                #(#extract_values)*
+
+                std::result::Result::Ok(#name {
+                    #(#field_names),*
+                })
+            }
+        }
     }
 }
