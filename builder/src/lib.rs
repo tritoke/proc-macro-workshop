@@ -21,10 +21,17 @@ pub fn derive(input: TokenStream) -> TokenStream {
     let builder_name = &builder.name;
     let builder_struct = builder.struct_def();
     let default_instance = builder.default_instance();
+    let setters = builder.setter_methods();
 
     quote! {
         #builder_struct
 
+        #[automatically_derived]
+        impl #builder_name {
+            #(#setters)*
+        }
+
+        #[automatically_derived]
         impl #name {
             fn builder() -> #builder_name {
                 #default_instance
@@ -62,10 +69,6 @@ impl Builder {
         for field in fields.iter_mut() {
             field.vis = Visibility::Inherited;
             field.attrs.clear();
-            let current_type = &field.ty;
-            field.ty = parse_quote! {
-                Option<#current_type>
-            };
         }
 
         Ok(Self { name, fields })
@@ -73,12 +76,16 @@ impl Builder {
 
     fn struct_def(&self) -> TokenStream2 {
         let builder_name = &self.name;
-        let fields = &self.fields;
+        let optionalised_fields = self.fields.iter().map(|field| {
+            let mut field = field.clone();
+            let curr_ty = field.ty;
+            field.ty = parse_quote! { Option<#curr_ty> };
+            field
+        });
 
         quote! {
-            #[automatically_derived]
             struct #builder_name {
-                #fields
+                #(#optionalised_fields),*
             }
         }
     }
@@ -92,5 +99,21 @@ impl Builder {
                 #(#field_names: None),*
             }
         }
+    }
+
+    fn setter_methods(&self) -> Vec<TokenStream2> {
+        self.fields
+            .iter()
+            .map(|field| {
+                let name = &field.ident;
+                let field_type = &field.ty;
+                quote! {
+                    fn #name(&mut self, #name: #field_type) -> &mut Self {
+                        self.#name = Some(#name);
+                        self
+                    }
+                }
+            })
+            .collect()
     }
 }

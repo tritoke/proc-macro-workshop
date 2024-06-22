@@ -1,10 +1,14 @@
-// Write code here.
+// Generate methods on the builder for setting a value of each of the struct
+// fields.
 //
-// To see what the code looks like after macro expansion:
-//     $ cargo expand
+//     impl CommandBuilder {
+//         fn executable(&mut self, executable: String) -> &mut Self {
+//             self.executable = Some(executable);
+//             self
+//         }
 //
-// To run the code:
-//     $ cargo run
+//         ...
+//     }
 
 use derive_builder::Builder;
 
@@ -17,7 +21,9 @@ pub struct Command {
 }
 
 fn main() {
-    let builder = Command::builder();
-
-    let _ = builder;
+    let mut builder = Command::builder();
+    builder.executable("cargo".to_owned());
+    builder.args(vec!["build".to_owned(), "--release".to_owned()]);
+    builder.env(vec![]);
+    builder.current_dir("..".to_owned());
 }
