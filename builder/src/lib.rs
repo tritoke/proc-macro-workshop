@@ -130,14 +130,14 @@ impl Builder {
         let extract_values = self.fields.iter().map(|field| {
             let field_name = &field.ident;
             quote! {
-                let #field_name = self.#field_name.ok_or("#field_name")?;
+                let #field_name = self.#field_name.take().ok_or("#field_name")?;
             }
         });
 
         let field_names = self.fields.iter().map(|field| &field.ident);
 
         quote! {
-            fn build(self) -> ::std::result::Result<#name, ::std::boxed::Box<dyn ::std::error::Error>> {
+            fn build(&mut self) -> ::std::result::Result<#name, ::std::boxed::Box<dyn ::std::error::Error>> {
                 #(#extract_values)*
 
                 std::result::Result::Ok(#name {
