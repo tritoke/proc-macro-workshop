@@ -93,6 +93,13 @@ impl BuilderField {
 
         let attr_inner: MetaNameValue = builder_attr.parse_args()?;
 
+        if !attr_inner.path.is_ident("each") {
+            return Err(Error::new_spanned(
+                builder_attr.meta.clone(),
+                "expected `builder(each = \"...\")`",
+            ));
+        }
+
         let Expr::Lit(expr_lit) = attr_inner.value else {
             return Err(Error::new_spanned(
                 attr_inner,
