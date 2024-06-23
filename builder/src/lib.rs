@@ -2,11 +2,11 @@ use proc_macro::TokenStream;
 use proc_macro2::{Ident, Span, TokenStream as TokenStream2};
 use quote::quote;
 use syn::{
-    parse_macro_input, parse_quote, punctuated::Punctuated, token::Comma, Data, DeriveInput, Error,
-    Field, Fields, GenericArgument, PathArguments, PathSegment, Type, TypePath, Visibility,
+    parse_macro_input, Data, DeriveInput, Error, Expr, Field, Fields, GenericArgument, Lit,
+    MetaNameValue, PathArguments, PathSegment, Type, TypePath,
 };
 
-#[proc_macro_derive(Builder)]
+#[proc_macro_derive(Builder, attributes(builder))]
 pub fn derive(input: TokenStream) -> TokenStream {
     let _ = input;
 
@@ -43,19 +43,13 @@ pub fn derive(input: TokenStream) -> TokenStream {
     .into()
 }
 
-struct Builder {
-    name: Ident,
-    input_name: Ident,
-    fields: Punctuated<Field, Comma>,
-}
-
-fn type_extract_option_inner(r#type: &Type) -> Option<&Type> {
+fn type_extract_inner<'a>(outer_type: &str, r#type: &'a Type) -> Option<&'a Type> {
     let Type::Path(TypePath { path, .. }) = &r#type else {
         return None;
     };
 
     let PathSegment { ident, arguments } = path.segments.first()?;
-    if ident != "Option" {
+    if ident != outer_type {
         return None;
     }
 
@@ -70,8 +64,166 @@ fn type_extract_option_inner(r#type: &Type) -> Option<&Type> {
     Some(inner_type)
 }
 
+enum BuilderField {
+    Normal {
+        name: Ident,
+        ty: Type,
+    },
+    Optional {
+        name: Ident,
+        inner_ty: Type,
+    },
+    FlattenEach {
+        method_name: Ident,
+        field_name: Ident,
+        inner_ty: Type,
+    },
+}
+
+impl BuilderField {
+    fn parse_each_attribute(field: &Field) -> syn::Result<Option<Ident>> {
+        let builder_attr = match field
+            .attrs
+            .iter()
+            .find(|attr| attr.path().is_ident("builder"))
+        {
+            Some(attr) => attr,
+            None => return Ok(None),
+        };
+
+        let attr_inner: MetaNameValue = builder_attr.parse_args()?;
+
+        let Expr::Lit(expr_lit) = attr_inner.value else {
+            return Err(Error::new_spanned(
+                attr_inner,
+                "Argument to each must be a literal string",
+            ));
+        };
+
+        let Lit::Str(lit_str) = expr_lit.lit else {
+            return Err(Error::new_spanned(
+                expr_lit,
+                "Argument to each must be a literal string",
+            ));
+        };
+
+        lit_str.parse().map(Some)
+    }
+
+    fn struct_member(&self) -> TokenStream2 {
+        match self {
+            BuilderField::Normal { name, ty } | BuilderField::Optional { name, inner_ty: ty } => {
+                quote! { #name: ::std::option::Option<#ty>, }
+            }
+            BuilderField::FlattenEach {
+                field_name,
+                inner_ty,
+                ..
+            } => quote! { #field_name: ::std::vec::Vec<#inner_ty>, },
+        }
+    }
+
+    fn default_assignment(&self) -> TokenStream2 {
+        match self {
+            BuilderField::Normal { name, .. } | BuilderField::Optional { name, .. } => {
+                quote! { #name: ::std::option::Option::None, }
+            }
+            BuilderField::FlattenEach { field_name, .. } => {
+                quote! { #field_name: ::std::vec::Vec::new(), }
+            }
+        }
+    }
+
+    fn setter(&self) -> TokenStream2 {
+        match self {
+            BuilderField::Normal { name, ty } | BuilderField::Optional { name, inner_ty: ty } => {
+                quote! {
+                    fn #name(&mut self, #name: #ty) -> &mut Self {
+                        self.#name = ::std::option::Option::Some(#name);
+                        self
+                    }
+                }
+            }
+            BuilderField::FlattenEach {
+                method_name,
+                field_name,
+                inner_ty,
+            } => {
+                quote! {
+                    fn #method_name(&mut self, #method_name: #inner_ty) -> &mut Self {
+                        self.#field_name.push(#method_name);
+                        self
+                    }
+                }
+            }
+        }
+    }
+
+    fn extract_field(&self) -> TokenStream2 {
+        match self {
+            BuilderField::Normal { name, .. } => {
+                quote! { let #name = self.#name.take().ok_or(::std::concat!("No value for ", ::std::stringify!(#name)))?; }
+            }
+            BuilderField::Optional { name, .. } => {
+                quote! { let #name = self.#name.take(); }
+            }
+            BuilderField::FlattenEach { field_name, .. } => {
+                quote! {
+                let mut #field_name = Vec::new();
+                ::std::mem::swap(&mut #field_name, &mut self.#field_name); }
+            }
+        }
+    }
+
+    fn name(&self) -> &Ident {
+        match self {
+            BuilderField::Normal { name, .. } | BuilderField::Optional { name, .. } => name,
+            BuilderField::FlattenEach { field_name, .. } => field_name,
+        }
+    }
+}
+
+impl TryFrom<Field> for BuilderField {
+    type Error = Error;
+
+    fn try_from(field: Field) -> syn::Result<Self> {
+        let field_name = field.ident.clone().expect("Named field has no name???");
+
+        if let Some(method_name) = Self::parse_each_attribute(&field)? {
+            let Some(inner_ty) = type_extract_inner("Vec", &field.ty).cloned() else {
+                return Err(Error::new_spanned(
+                    field.ty,
+                    "Cannot apply each to a member whose type is not Vec<T>",
+                ));
+            };
+
+            Ok(Self::FlattenEach {
+                method_name,
+                field_name,
+                inner_ty,
+            })
+        } else if let Some(inner_ty) = type_extract_inner("Option", &field.ty).cloned() {
+            Ok(Self::Optional {
+                name: field_name,
+                inner_ty,
+            })
+        } else {
+            Ok(Self::Normal {
+                name: field_name,
+                ty: field.ty,
+            })
+        }
+    }
+}
+
+struct Builder {
+    name: Ident,
+    input_name: Ident,
+    fields: Vec<BuilderField>,
+}
+
 impl Builder {
-    fn try_new(input: &DeriveInput) -> Result<Self, Error> {
+    fn try_new(input: &DeriveInput) -> syn::Result<Self> {
         let input_name = input.ident.clone();
         let name = Ident::new(&format!("{}Builder", input.ident), Span::call_site());
 
@@ -89,82 +241,47 @@ impl Builder {
             ));
         };
 
-        let mut fields = nf.named.clone();
-
-        for field in fields.iter_mut() {
-            field.vis = Visibility::Inherited;
-            field.attrs.clear();
-        }
-
         Ok(Self {
             name,
             input_name,
-            fields,
+            fields: nf
+                .named
+                .into_iter()
+                .map(TryFrom::try_from)
+                .collect::<syn::Result<_>>()?,
         })
     }
 
     fn struct_def(&self) -> TokenStream2 {
         let builder_name = &self.name;
-        let optionalised_fields = self.fields.iter().map(|field| {
-            let mut field = field.clone();
-            let curr_ty_or_inner = type_extract_option_inner(&field.ty).unwrap_or(&field.ty);
-            field.ty = parse_quote! { ::std::option::Option<#curr_ty_or_inner> };
-            field
-        });
+        let fields = self.fields.iter().map(BuilderField::struct_member);
 
         quote! {
             struct #builder_name {
-                #(#optionalised_fields),*
+                #(#fields)*
             }
         }
     }
 
     fn default_instance(&self) -> TokenStream2 {
         let builder_name = &self.name;
-        let field_names = self.fields.iter().map(|field| &field.ident);
+        let assignments = self.fields.iter().map(BuilderField::default_assignment);
 
         quote! {
             #builder_name {
-                #(#field_names: ::std::option::Option::None),*
+                #(#assignments)*
             }
         }
     }
 
     fn setter_methods(&self) -> Vec<TokenStream2> {
-        self.fields
-            .iter()
-            .map(|field| {
-                let name = &field.ident;
-                let arg_type = type_extract_option_inner(&field.ty).unwrap_or(&field.ty);
-                quote! {
-                    fn #name(&mut self, #name: #arg_type) -> &mut Self {
-                        self.#name = ::std::option::Option::Some(#name);
-                        self
-                    }
-                }
-            })
-            .collect()
+        self.fields.iter().map(BuilderField::setter).collect()
     }
 
     fn build_method(&self) -> TokenStream2 {
         let name = &self.input_name;
-        let extract_values = self.fields.iter().map(|field| {
-            let field_name = &field.ident;
-            let field_value = if type_extract_option_inner(&field.ty).is_some() {
-                quote! {
-                    self.#field_name.take()
-                }
-            } else {
-                quote! {
-                    self.#field_name.take().ok_or("No value for #field_name")?
-                }
-            };
-            quote! {
-                let #field_name = #field_value;
-            }
-        });
-
-        let field_names = self.fields.iter().map(|field| &field.ident);
+        let extract_values = self.fields.iter().map(BuilderField::extract_field);
+        let field_names = self.fields.iter().map(BuilderField::name);
 
         quote! {
             fn build(&mut self) -> ::std::result::Result<#name, ::std::boxed::Box<dyn ::std::error::Error>> {
